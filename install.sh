@@ -18,7 +18,7 @@ main() {
   # shellcheck disable=SC2064  # $tmp est développé maintenant : la variable locale n'existe plus à la sortie.
   trap "rm -rf '$tmp'" EXIT
   echo "Téléchargement de vps depuis $repo..."
-  for f in vps harden-debian12.sh; do
+  for f in vps harden-debian12.sh audit.sh; do
     curl -fsSL "$base/$f" -o "$tmp/$f"
   done
   chmod +x "$tmp/vps"

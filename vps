@@ -2,10 +2,12 @@
 # vps : sécuriser et gérer tes VPS Debian 12 depuis ton Mac.
 #
 #   vps                             menu interactif
-#   vps add [<nom> <ip>] [options]  sécurise un nouveau VPS et crée le raccourci « ssh <nom> »
-#       --user <u>                  compte fourni par l'hébergeur (défaut : root)
+#   vps add [<nom> <ip>] [options]  sécurise un VPS NEUF et crée le raccourci « ssh <nom> »
+#   vps adopt [<nom> <ip>] [opt.]   sécurise un VPS DÉJÀ EN PRODUCTION, sans casser ses services
+#       --user <u>                  compte pour s'y connecter aujourd'hui (défaut : root)
 #       --port <p>                  port SSH (défaut : 22)
-#       --no-docker                 ne pas installer Docker
+#       --no-docker                 (add) ne pas installer Docker
+#   vps audit [nom...|compte@ip]    audit de sécurité (lecture seule), tous les VPS par défaut
 #   vps list                        liste tes VPS
 #   vps keys                        liste les clés autorisées
 #   vps addkey [fichier.pub]        autorise une nouvelle clé (autre Mac, PC...)
@@ -15,15 +17,18 @@
 #   vps rm <nom>                    retire le raccourci (ne touche pas au serveur)
 #   vps update                      installe la dernière version depuis GitHub
 #
-# Sans arguments, « vps add », « vps addkey » et « vps delkey » posent les questions.
+# Sans arguments, « add », « adopt », « addkey » et « delkey » posent les questions.
 set -euo pipefail
 
 VPS_HOME="${VPS_HOME:-$HOME/.vps}"
 BIN_DIR="$VPS_HOME/bin"
 KEYS_DIR="$VPS_HOME/keys"
 HOSTS_DIR="$VPS_HOME/hosts"
+AUDITS_DIR="$VPS_HOME/audits"
 CONF="$VPS_HOME/config"
 HARDEN="$BIN_DIR/harden-debian12.sh"
+AUDIT="$BIN_DIR/audit.sh"
+SCRIPTS="vps harden-debian12.sh audit.sh"
 
 ADMIN_USER="$(id -un | tr '[:upper:]' '[:lower:]')"
 IDENTITY="$HOME/.ssh/id_ed25519"
@@ -33,6 +38,10 @@ if [[ -f "$CONF" ]]; then
   # shellcheck source=/dev/null
   . "$CONF"
 fi
+
+# Remplis par ask_target / parse_target, et par boot_open.
+NAME="" IP="" BOOT_USER=root PORT=22 DOCKER=1
+BOOT=()
 
 say()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m ✓\033[0m %s\n' "$*"; }
@@ -60,6 +69,7 @@ ask_yn() {
 }
 
 need_init() { [[ -f "$CONF" && -f "$HARDEN" ]] || die "Lance d'abord l'installation (voir le README)."; }
+need_audit() { [[ -f "$AUDIT" ]] || die "Script d'audit absent : lance « vps update »."; }
 
 host_file() { echo "$HOSTS_DIR/$1.conf"; }
 
@@ -83,6 +93,26 @@ targets() {
   fi
 }
 
+# Valeur d'un réglage noté dans la première ligne du raccourci (« # vps: mode=existing ports=... »).
+meta_get() {
+  awk -v k="$2" '/^# vps:/ { for (i = 3; i <= NF; i++) if (index($i, k "=") == 1) print substr($i, length(k) + 2) }' "$1"
+}
+
+write_host() {  # nom ip port réglages
+  cat > "$(host_file "$1")" <<EOF
+# vps: $4
+Host $1
+  HostName $2
+  User $ADMIN_USER
+  Port $3
+  IdentityFile $IDENTITY
+  IdentitiesOnly yes
+  AddKeysToAgent yes
+  IgnoreUnknown UseKeychain
+  UseKeychain yes
+EOF
+}
+
 # Toutes les clés publiques de ~/.vps/keys, une par ligne.
 all_keys() {
   local files
@@ -104,26 +134,146 @@ keys_b64() {
   printf '%s\n' "$keys" | base64 | tr -d '\n'
 }
 
-# Envoie le script de durcissement et l'exécute en root, en une seule connexion
-# (donc un seul mot de passe à taper au premier passage).
-run_harden() {
-  local keys=$1 port=$2 docker=$3 sudo=$4 script remote
-  shift 4  # le reste : arguments ssh, cible comprise
-  script=$(base64 < "$HARDEN" | tr -d '\n')
-  remote="f=\$(mktemp) && echo '$script' | base64 -d > \"\$f\" && ${sudo}env NEW_USER='$ADMIN_USER' SSH_PORT='$port' INSTALL_DOCKER='$docker' AUTHORIZED_KEYS_B64='$keys' bash \"\$f\"; rc=\$?; rm -f \"\$f\"; exit \$rc"
-  ssh -t "$@" "$remote"
+# Variables du script de sécurisation : port docker config_docker apt ports comptes root.
+harden_env() {
+  printf "NEW_USER='%s' SSH_PORT='%s' INSTALL_DOCKER='%s' DOCKER_DAEMON_CONFIG='%s' APT_UPGRADE='%s' EXTRA_PORTS='%s' EXTRA_SSH_USERS='%s' ROOT_LOGIN='%s'" \
+    "$ADMIN_USER" "$@"
+}
+
+# Envoie un script et l'exécute en root sur le serveur, en une seule commande ssh.
+# $1 script, $2 variables (« A='x' B='y' »), $3 préfixe sudo, $4 1 = terminal interactif ;
+# le reste : arguments ssh, cible comprise. ADMIN_IP permet à l'audit de reconnaître ta connexion.
+run_root() {
+  local script=$1 envs=$2 sudo=$3 tty=$4 b64 remote
+  shift 4
+  b64=$(base64 < "$script" | tr -d '\n')
+  remote="f=\$(mktemp) && echo '$b64' | base64 -d > \"\$f\" && ${sudo}env ADMIN_IP=\"\${SSH_CLIENT%% *}\" $envs bash \"\$f\"; rc=\$?; rm -f \"\$f\"; exit \$rc"
+  # -n : sans terminal, ssh ne doit pas avaler les réponses destinées aux questions suivantes.
+  if [[ $tty == 1 ]]; then ssh -t "$@" "$remote"; else ssh -n "$@" "$remote"; fi
+}
+
+# Connexion maître vers un serveur qui n'a pas encore de raccourci : on s'authentifie une
+# seule fois (un seul mot de passe), les commandes suivantes passent par elle.
+boot_open() {  # compte@ip port
+  BOOT=(-p "$2" -i "$IDENTITY" -o StrictHostKeyChecking=accept-new -o "ControlPath=/tmp/vps-$(id -u)-%C" "$1")
+  say "Connexion à $1 (le mot de passe du serveur peut être demandé une fois)"
+  ssh -f -N -o ControlMaster=yes -o ConnectTimeout=15 "${BOOT[@]}" || die "Connexion impossible à $1 (port $2)."
+}
+boot_close() {
+  if [[ -n "${BOOT[*]:-}" ]]; then ssh -O exit "${BOOT[@]}" 2>/dev/null || true; fi
+  BOOT=()
+}
+
+# Questions communes à « add » et « adopt ».
+ask_target() {
+  while :; do
+    NAME=$(ask "Nom du raccourci (ex : web1)")
+    if [[ ! "$NAME" =~ ^[A-Za-z0-9._-]+$ ]]; then warn "Lettres, chiffres, . _ - uniquement."
+    elif [[ -f "$(host_file "$NAME")" ]]; then warn "$NAME existe déjà."
+    else break; fi
+  done
+  while :; do
+    IP=$(ask "Adresse IP du VPS")
+    [[ "$IP" =~ ^[A-Za-z0-9.:-]+$ ]] && break
+    warn "Adresse invalide."
+  done
+  BOOT_USER=$(ask "Compte pour s'y connecter aujourd'hui" root)
+  while :; do
+    PORT=$(ask "Port SSH" 22)
+    [[ "$PORT" =~ ^[0-9]+$ ]] && break
+    warn "Port invalide."
+  done
+}
+
+parse_target() {
+  (($# >= 2)) || die "Il faut un nom et une adresse IP : vps $CMD <nom> <ip> [--user root] [--port 22]"
+  NAME=$1 IP=$2
+  shift 2
+  while (($#)); do
+    case $1 in
+      --user) BOOT_USER=${2:?--user attend un nom}; shift 2 ;;
+      --port) PORT=${2:?--port attend un numéro}; shift 2 ;;
+      --no-docker) DOCKER=0; shift ;;
+      *) die "Option inconnue : $1" ;;
+    esac
+  done
+}
+
+check_target() {
+  [[ "$NAME" =~ ^[A-Za-z0-9._-]+$ ]] || die "Nom invalide : $NAME (lettres, chiffres, . _ -)"
+  [[ "$IP" =~ ^[A-Za-z0-9.:-]+$ ]] || die "Adresse invalide : $IP"
+  [[ "$PORT" =~ ^[0-9]+$ ]] || die "Port invalide : $PORT"
+  [[ "$BOOT_USER" =~ ^[A-Za-z0-9._-]+$ ]] || die "Compte invalide : $BOOT_USER"
+  [[ ! -f "$(host_file "$NAME")" ]] || die "$NAME existe déjà. Pour le refaire : vps rm $NAME"
+}
+
+# Vérifie un VPS fraîchement sécurisé, via son raccourci. On lit la config effective de sshd
+# plutôt que de tenter une connexion root : une tentative ratée compterait pour Fail2ban.
+verify_host() {
+  local conf
+  say "Vérification"
+  conf=$(ssh -o ConnectTimeout=10 "$1" 'sudo -n sshd -T' </dev/null) \
+    || die "« ssh $1 » ne fonctionne pas. Le raccourci est dans $(host_file "$1")."
+  ok "Connexion par clé et sudo : OK"
+  if grep -qx 'passwordauthentication no' <<<"$conf"; then ok "Mots de passe refusés"
+  else warn "sshd accepte encore les mots de passe : vérifie /etc/ssh/sshd_config.d/ sur le serveur."; fi
+  if grep -qx 'permitrootlogin no' <<<"$conf"; then ok "Root refusé"
+  elif grep -qE '^permitrootlogin (without-password|prohibit-password)$' <<<"$conf"; then ok "Root : par clé seulement"
+  else warn "sshd accepte encore root : vérifie /etc/ssh/sshd_config.d/ sur le serveur."; fi
+}
+
+# Affiche un rapport d'audit et le garde dans ~/.vps/audits.
+# $1 titre, $2 rapport brut, $3 « tout » ou « important » (critiques et élevés seulement),
+# $4 nom du fichier enregistré. Remplit N_CRIT, N_HIGH et N_NORM.
+show_report() {
+  local title=$1 report=$2 mode=${3:-tout} save level lvl t why fix findings out
+  save=$(printf '%s' "${4:-$title}" | tr -c 'A-Za-z0-9._-' '_')
+  findings=$(grep '^F|' <<<"$report" || true)
+  N_CRIT=$(grep -c '^F|CRITIQUE|' <<<"$findings" || true)
+  N_HIGH=$(grep -c '^F|ELEVE|' <<<"$findings" || true)
+  N_NORM=$(grep -c '^F|NORMAL|' <<<"$findings" || true)
+  out=$(mktemp)
+  {
+    printf '\n\033[1m━━━ Audit de sécurité : %s ━━━\033[0m\n' "$title"
+    for level in CRITIQUE ELEVE NORMAL OK; do
+      if [[ $mode == important && ($level == NORMAL || $level == OK) ]]; then continue; fi
+      if [[ $level == OK ]] && grep -q '^F|OK|' <<<"$findings"; then printf '\n\033[1mCe qui va bien\033[0m\n'; fi
+      while IFS='|' read -r _ lvl _ t why fix; do
+        [[ "$lvl" == "$level" ]] || continue
+        case $level in
+          CRITIQUE) printf '\n\033[1;97;41m CRITIQUE \033[0m \033[1m%s\033[0m\n' "$t" ;;
+          ELEVE)    printf '\n\033[1;30;43m  ÉLEVÉ   \033[0m \033[1m%s\033[0m\n' "$t" ;;
+          NORMAL)   printf '\n\033[1;97;44m  NORMAL  \033[0m %s\n' "$t" ;;
+          OK)       printf ' \033[32m✓\033[0m %s\n' "$t" ;;
+        esac
+        if [[ $level != OK ]]; then
+          if [[ -n "$why" ]]; then printf '   Pourquoi : %s\n' "$why"; fi
+          if [[ -n "$fix" ]]; then printf '   À faire  : %s\n' "$fix"; fi
+        fi
+      done <<<"$findings"
+    done
+    printf '\n\033[1mBilan :\033[0m \033[31m%s critique(s)\033[0m, \033[33m%s élevé(s)\033[0m, \033[34m%s normal(aux)\033[0m\n' \
+      "$N_CRIT" "$N_HIGH" "$N_NORM"
+  } > "$out"
+  cat "$out"
+  mkdir -p "$AUDITS_DIR"
+  sed $'s/\x1b\\[[0-9;]*m//g' "$out" > "$AUDITS_DIR/$save-$(date +%Y%m%d-%H%M).txt"
+  rm -f "$out"
 }
 
 cmd_init() {
-  local src inc tmp own_key def rc="$HOME/.zshrc"
+  local src inc tmp own_key def f rc="$HOME/.zshrc"
   src=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
   mkdir -p "$BIN_DIR" "$KEYS_DIR" "$HOSTS_DIR"
   chmod 700 "$VPS_HOME"
 
   if [[ "$src" != "$BIN_DIR" ]]; then
-    [[ -f "$src/harden-debian12.sh" ]] || die "harden-debian12.sh doit être dans le même dossier que vps."
+    for f in $SCRIPTS; do
+      [[ -f "$src/$f" ]] || die "$f doit être dans le même dossier que vps."
+    done
     install -m 755 "${BASH_SOURCE[0]}" "$BIN_DIR/vps"
     install -m 644 "$src/harden-debian12.sh" "$HARDEN"
+    install -m 644 "$src/audit.sh" "$AUDIT"
     ok "Outil installé dans $BIN_DIR"
   fi
 
@@ -190,97 +340,222 @@ EOF
 
 cmd_add() {
   need_init
-  local name="" ip="" boot_user=root port=22 docker=1 sudo="" keys f sshd_conf
+  local sudo="" keys envs
   if (($# == 0)); then
     say "Nouveau VPS"
-    while :; do
-      name=$(ask "Nom du raccourci (ex : web1)")
-      if [[ ! "$name" =~ ^[A-Za-z0-9._-]+$ ]]; then warn "Lettres, chiffres, . _ - uniquement."
-      elif [[ -f "$(host_file "$name")" ]]; then warn "$name existe déjà."
-      else break; fi
-    done
-    while :; do
-      ip=$(ask "Adresse IP du VPS")
-      [[ "$ip" =~ ^[A-Za-z0-9.:-]+$ ]] && break
-      warn "Adresse invalide."
-    done
-    boot_user=$(ask "Compte donné par l'hébergeur" root)
-    while :; do
-      port=$(ask "Port SSH" 22)
-      [[ "$port" =~ ^[0-9]+$ ]] && break
-      warn "Port invalide."
-    done
-    if ask_yn "Installer Docker ?" o; then docker=1; else docker=0; fi
+    ask_target
+    if ask_yn "Installer Docker ?" o; then DOCKER=1; else DOCKER=0; fi
     echo
-    echo "  $name : $boot_user@$ip, port $port, Docker : $( ((docker)) && echo oui || echo non)"
-    echo "  Ensuite : connexion par clé uniquement, en tant que $ADMIN_USER, avec « ssh $name »."
+    echo "  $NAME : $BOOT_USER@$IP, port $PORT, Docker : $( ((DOCKER)) && echo oui || echo non)"
+    echo "  Ensuite : connexion par clé uniquement, en tant que $ADMIN_USER, avec « ssh $NAME »."
     ask_yn "On y va ?" o || die "Annulé."
   else
-    (($# >= 2)) || die "Usage : vps add <nom> <ip> [--user root] [--port 22] [--no-docker]"
-    name=$1 ip=$2
-    shift 2
-    while (($#)); do
-      case $1 in
-        --user) boot_user=${2:?--user attend un nom}; shift 2 ;;
-        --port) port=${2:?--port attend un numéro}; shift 2 ;;
-        --no-docker) docker=0; shift ;;
-        *) die "Option inconnue : $1" ;;
-      esac
-    done
+    parse_target "$@"
   fi
-  [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || die "Nom invalide : $name (lettres, chiffres, . _ -)"
-  [[ "$ip" =~ ^[A-Za-z0-9.:-]+$ ]] || die "Adresse invalide : $ip"
-  [[ "$port" =~ ^[0-9]+$ ]] || die "Port invalide : $port"
-  [[ "$boot_user" =~ ^[A-Za-z0-9._-]+$ ]] || die "Compte invalide : $boot_user"
-  f=$(host_file "$name")
-  [[ ! -f "$f" ]] || die "$name existe déjà. Pour le refaire : vps rm $name"
-  [[ "$boot_user" == root ]] || sudo="sudo "
+  check_target
+  [[ "$BOOT_USER" == root ]] || sudo="sudo "
   keys=$(keys_b64)
 
-  say "Sécurisation de $name ($boot_user@$ip). Le mot de passe du serveur peut être demandé une fois."
-  if ! run_harden "$keys" "$port" "$docker" "$sudo" -p "$port" -i "$IDENTITY" \
-       -o StrictHostKeyChecking=accept-new "$boot_user@$ip"; then
-    die "Échec. Si le serveur a déjà été sécurisé (root bloqué), relance avec : vps add $name $ip --user $ADMIN_USER"
+  boot_open "$BOOT_USER@$IP" "$PORT"
+  trap boot_close EXIT
+  say "Sécurisation de $NAME"
+  envs=$(harden_env "$PORT" "$DOCKER" 1 1 "" "" no)
+  run_root "$HARDEN" "$envs AUTHORIZED_KEYS_B64='$keys'" "$sudo" 1 "${BOOT[@]}" \
+    || die "Échec. Si le serveur a déjà été sécurisé (root bloqué), relance avec : vps add $NAME $IP --user $ADMIN_USER"
+  boot_close
+  trap - EXIT
+
+  write_host "$NAME" "$IP" "$PORT" "mode=new docker=$DOCKER"
+  verify_host "$NAME"
+  echo
+  ok "C'est prêt : ssh $NAME"
+}
+
+cmd_adopt() {
+  need_init
+  need_audit
+  local sudo="" keys report before line u d ip m where def envs info
+  local proto pport expo src label kind _reach dock
+  local extra_ports="" extra_users="" root_login=no apt_upgrade=0 docker_public="" candidates
+  local p_lines=()
+  DOCKER=0
+  if (($# == 0)); then
+    say "VPS déjà en production : audit d'abord, puis sécurisation sans casser tes services."
+    ask_target
+  else
+    parse_target "$@"
+  fi
+  check_target
+  [[ "$BOOT_USER" == root ]] || sudo="sudo "
+  keys=$(keys_b64)
+
+  boot_open "$BOOT_USER@$IP" "$PORT"
+  trap boot_close EXIT
+  say "Audit de $NAME (lecture seule : rien n'est modifié)"
+  report=$(run_root "$AUDIT" "" "${sudo:+sudo -n }" 0 "${BOOT[@]}") \
+    || die "Audit impossible. Avec un compte autre que root, il faut sudo sans mot de passe."
+  show_report "$NAME" "$report" tout "$NAME-avant"
+  before="$N_CRIT critique(s), $N_HIGH élevé(s), $N_NORM normal(aux)"
+
+  echo
+  say "Préparation de la sécurisation. Rien n'est appliqué avant ta confirmation finale."
+
+  # Ports : on lit tout d'abord, les questions viennent ensuite (elles lisent le clavier).
+  while IFS= read -r line; do
+    if [[ -n "$line" ]]; then p_lines+=("$line"); fi
+  done <<<"$(grep '^P|' <<<"$report" || true)"
+  for line in ${p_lines[@]+"${p_lines[@]}"}; do
+    IFS='|' read -r _ proto pport expo src label kind _reach dock <<<"$line"
+    if [[ $dock == 1 ]]; then
+      docker_public="$docker_public    - $pport ($label, conteneur ${src#docker:})"$'\n'
+      continue
+    fi
+    [[ $kind == ssh || $kind == web || $pport == "$PORT" ]] && continue
+    def=o
+    [[ $kind == db || $kind == dockerapi ]] && def=n
+    if [[ $expo == prive ]]; then where="depuis ton réseau privé"; else where="depuis Internet"; fi
+    if ask_yn "Port $pport/$proto ($label, programme « $src ») : le garder joignable $where ?" "$def"; then
+      extra_ports="$extra_ports $pport/$proto"
+    fi
+  done
+
+  # Comptes SSH : ceux qui ont des clés ou se sont connectés ces 30 derniers jours.
+  candidates=$( { grep '^K|' <<<"$report"; grep '^U|' <<<"$report"; } | cut -d'|' -f2 \
+    | grep -vxE "root|$ADMIN_USER" | sort -u || true)
+  for u in $candidates; do
+    [[ "$u" =~ ^[a-z_][a-z0-9_.-]*$ ]] || continue
+    line=$(grep "^U|$u|" <<<"$report" | sort -t'|' -k4 | tail -n1 || true)
+    if [[ -n "$line" ]]; then
+      IFS='|' read -r _ _ m d ip <<<"$line"
+      info="connecté par $( [[ $m == publickey ]] && echo clé || echo "mot de passe") le $d depuis $ip"
+    else
+      info="a des clés SSH, pas de connexion ces 30 derniers jours"
+    fi
+    if ask_yn "Le compte « $u » ($info) : lui garder l'accès SSH par clé ?" o; then
+      extra_users="$extra_users $u"
+      if grep -q "^U|$u|password|" <<<"$report"; then
+        warn "« $u » se connecte par mot de passe : il lui faudra une clé SSH, les mots de passe seront refusés."
+      fi
+    fi
+  done
+
+  line=$(grep '^U|root|publickey|' <<<"$report" || true)
+  if [[ -n "$line" ]]; then
+    IFS='|' read -r _ _ _ d ip <<<"$line"
+    if ask_yn "Root s'est connecté par clé le $d depuis $ip (souvent un déploiement automatique). Garder root par clé ? (déconseillé)" n; then
+      root_login=key
+    fi
+  fi
+  line=$(grep '^U|root|password|' <<<"$report" || true)
+  if [[ -n "$line" ]]; then
+    IFS='|' read -r _ _ _ d ip <<<"$line"
+    warn "Root s'est connecté par mot de passe le $d depuis $ip : ce sera refusé. Si un outil l'utilise, donne-lui une clé SSH."
   fi
 
-  cat > "$f" <<EOF
-# vps: docker=$docker
-Host $name
-  HostName $ip
-  User $ADMIN_USER
-  Port $port
-  IdentityFile $IDENTITY
-  IdentitiesOnly yes
-  AddKeysToAgent yes
-  IgnoreUnknown UseKeychain
-  UseKeychain yes
-EOF
+  if ask_yn "Installer aussi toutes les mises à jour maintenant ? (Docker et d'autres services peuvent redémarrer quelques secondes)" n; then
+    apt_upgrade=1
+  fi
+  # shellcheck disable=SC2086  # on retire juste les espaces en trop
+  extra_ports=$(echo $extra_ports)
+  # shellcheck disable=SC2086
+  extra_users=$(echo $extra_users)
 
-  say "Vérification"
-  # On lit la config effective de sshd plutôt que de tenter une connexion root :
-  # une tentative ratée compterait comme un échec pour Fail2ban.
-  sshd_conf=$(ssh -o ConnectTimeout=10 "$name" 'sudo -n sshd -T' </dev/null) \
-    || die "« ssh $name » ne fonctionne pas. Le raccourci est dans $f."
-  ok "Connexion par clé et sudo : OK"
-  if grep -qx 'permitrootlogin no' <<<"$sshd_conf" && grep -qx 'passwordauthentication no' <<<"$sshd_conf"; then
-    ok "Root et mots de passe refusés"
-  else
-    warn "sshd accepte encore root ou les mots de passe : vérifie /etc/ssh/sshd_config.d/ sur le serveur."
+  echo
+  say "Récapitulatif pour $NAME"
+  echo "  - SSH : clé uniquement ; toi : « ssh $NAME » (compte $ADMIN_USER)"
+  [[ -n "$extra_users" ]] && echo "  - Comptes SSH gardés (par clé) : $extra_users"
+  echo "  - Root : $( [[ $root_login == key ]] && echo "par clé seulement" || echo interdit)"
+  echo "  - Pare-feu : ouverts = SSH ($PORT), 80, 443${extra_ports:+, $extra_ports} ; tout le reste fermé"
+  if [[ -n "$docker_public" ]]; then
+    echo "  - Ports Docker qui RESTENT publics (Docker passe avant le pare-feu, voir l'audit pour les fermer) :"
+    printf '%s' "$docker_public"
+  fi
+  echo "  - Fail2ban : 5 échecs en 10 min = 1 h de ban"
+  echo "  - Mises à jour de sécurité automatiques ; mises à jour complètes maintenant : $( ((apt_upgrade)) && echo oui || echo non)"
+  echo "  - Docker : configuration inchangée, aucun conteneur arrêté ni modifié"
+  echo
+  warn "Fais un snapshot du VPS chez ton hébergeur avant de continuer."
+  ask_yn "On y va ?" n || die "Annulé : rien n'a été modifié."
+
+  envs=$(harden_env "$PORT" 0 0 "$apt_upgrade" "$extra_ports" "$extra_users" "$root_login")
+  run_root "$HARDEN" "$envs AUTHORIZED_KEYS_B64='$keys'" "$sudo" 1 "${BOOT[@]}" \
+    || die "La sécurisation s'est arrêtée en route (voir le message au-dessus). Aucun service n'a été arrêté ; tu peux relancer « vps adopt »."
+  boot_close
+  trap - EXIT
+
+  write_host "$NAME" "$IP" "$PORT" "mode=existing docker=0 ports=${extra_ports// /,} users=${extra_users// /,} root=$root_login"
+  verify_host "$NAME"
+
+  say "Nouvel audit"
+  report=$(run_root "$AUDIT" "" "sudo -n " 0 -o ConnectTimeout=10 "$NAME") || die "Audit final impossible."
+  show_report "$NAME" "$report" important "$NAME-apres"
+  echo "  Avant : $before"
+  echo "  Après : $N_CRIT critique(s), $N_HIGH élevé(s), $N_NORM normal(aux)"
+  echo
+  ok "C'est prêt : ssh $NAME"
+}
+
+cmd_audit() {
+  need_init
+  need_audit
+  local port=22 t report name sudo rc=0 summary="" n=0
+  local args=()
+  while (($#)); do
+    case $1 in
+      --port) port=${2:?--port attend un numéro}; shift 2 ;;
+      tous|all) shift ;;
+      *) args+=("$1"); shift ;;
+    esac
+  done
+  if ((${#args[@]} == 0)); then
+    for t in $(all_hosts); do args+=("$t"); done
+    ((${#args[@]})) || die "Aucun VPS enregistré. Pour un serveur pas encore ajouté : vps audit root@<ip>"
+  fi
+  for t in "${args[@]}"; do
+    if [[ "$t" == *@* ]]; then
+      [[ "$t" =~ ^[A-Za-z0-9._-]+@[A-Za-z0-9.:-]+$ ]] || die "Cible invalide : $t"
+      sudo=""
+      [[ "${t%@*}" == root ]] || sudo="sudo -n "
+      boot_open "$t" "$port"
+      report=$(run_root "$AUDIT" "" "$sudo" 0 "${BOOT[@]}") || report=""
+      boot_close
+      name=${t#*@}
+    else
+      [[ -f "$(host_file "$t")" ]] || die "VPS inconnu : $t"
+      report=$(run_root "$AUDIT" "" "sudo -n " 0 -o ConnectTimeout=10 "$t") || report=""
+      name=$t
+    fi
+    if [[ -z "$report" ]]; then
+      warn "$name : audit impossible (connexion, ou sudo qui demande un mot de passe)."
+      rc=1
+      continue
+    fi
+    show_report "$name" "$report" tout
+    summary="$summary$(printf '  %-20s %3s critique(s)  %3s élevé(s)  %3s normal(aux)' "$name" "$N_CRIT" "$N_HIGH" "$N_NORM")"$'\n'
+    n=$((n + 1))
+    if ((N_CRIT > 0)); then rc=2; fi
+  done
+  if ((n > 1)); then
+    echo
+    say "Résumé"
+    printf '%s' "$summary"
   fi
   echo
-  ok "C'est prêt : ssh $name"
+  echo "Rapports enregistrés dans $AUDITS_DIR"
+  return $rc
 }
 
 cmd_list() {
   need_init
   local h n=0
-  printf '%-20s %-24s %-6s %s\n' NOM ADRESSE PORT UTILISATEUR
+  printf '%-20s %-24s %-6s %-12s %s\n' NOM ADRESSE PORT UTILISATEUR TYPE
   for h in $(all_hosts); do
-    awk -v n="$h" '$1=="HostName"{ip=$2} $1=="Port"{p=$2} $1=="User"{u=$2}
-      END {printf "%-20s %-24s %-6s %s\n", n, ip, p, u}' "$(host_file "$h")"
+    awk -v n="$h" -v mode="$( [[ "$(meta_get "$(host_file "$h")" mode)" == existing ]] && echo "existant" || echo "neuf")" \
+      '$1=="HostName"{ip=$2} $1=="Port"{p=$2} $1=="User"{u=$2}
+       END {printf "%-20s %-24s %-6s %-12s %s\n", n, ip, p, u, mode}' "$(host_file "$h")"
     n=$((n + 1))
   done
-  ((n)) || echo "(aucun VPS : ajoute-en un avec « vps add »)"
+  ((n)) || echo "(aucun VPS : ajoute-en un avec « vps add » ou « vps adopt »)"
 }
 
 cmd_keys() {
@@ -381,7 +656,7 @@ cmd_sync() {
 
 cmd_apply() {
   need_init
-  local keys hosts h f port docker good=0 bad=0
+  local keys hosts h f port envs good=0 bad=0
   keys=$(keys_b64)
   hosts=$(targets "$@")
   [[ -n "$hosts" ]] || die "Aucun VPS enregistré."
@@ -389,8 +664,14 @@ cmd_apply() {
     say "$h"
     f=$(host_file "$h")
     port=$(awk '$1=="Port"{print $2}' "$f")
-    docker=$(sed -n 's/^# vps: docker=//p' "$f")
-    if run_harden "$keys" "${port:-22}" "${docker:-1}" "sudo " "$h"; then
+    if [[ "$(meta_get "$f" mode)" == existing ]]; then
+      # Serveur existant : on rejoue avec les choix faits lors de « vps adopt ».
+      envs=$(harden_env "${port:-22}" 0 0 0 "$(meta_get "$f" ports | tr , ' ')" \
+        "$(meta_get "$f" users | tr , ' ')" "$(meta_get "$f" root)")
+    else
+      envs=$(harden_env "${port:-22}" "$(meta_get "$f" docker)" 1 1 "" "" no)
+    fi
+    if run_root "$HARDEN" "$envs AUTHORIZED_KEYS_B64='$keys'" "sudo " 1 "$h"; then
       ok "$h"
       good=$((good + 1))
     else
@@ -415,17 +696,15 @@ cmd_update() {
   need_init
   local base="${VPS_BASE_URL:-https://raw.githubusercontent.com/$VPS_REPO/$VPS_BRANCH}" tmp f
   tmp=$(mktemp -d)
-  for f in vps harden-debian12.sh; do
+  for f in $SCRIPTS; do
     curl -fsSL "$base/$f" -o "$tmp/$f" || { rm -rf "$tmp"; die "Téléchargement impossible : $base/$f"; }
+    bash -n "$tmp/$f" || { rm -rf "$tmp"; die "Fichier téléchargé invalide ($f), rien n'a été changé."; }
   done
-  if ! bash -n "$tmp/vps" || ! bash -n "$tmp/harden-debian12.sh"; then
-    rm -rf "$tmp"
-    die "Fichiers téléchargés invalides, rien n'a été changé."
-  fi
   chmod 755 "$tmp/vps"
-  chmod 644 "$tmp/harden-debian12.sh"
+  chmod 644 "$tmp/harden-debian12.sh" "$tmp/audit.sh"
   # mv plutôt que cp : le script en cours d'exécution n'est pas réécrit sous ses pieds.
   mv "$tmp/harden-debian12.sh" "$HARDEN"
+  mv "$tmp/audit.sh" "$AUDIT"
   mv "$tmp/vps" "$BIN_DIR/vps"
   rm -rf "$tmp"
   ok "vps est à jour. Pour appliquer la nouvelle sécurisation à tes serveurs : vps apply"
@@ -434,31 +713,37 @@ cmd_update() {
 
 cmd_menu() {
   need_init
-  local c
+  local c t
   while :; do
     echo
     echo "Que veux-tu faire ?"
     echo "  1) Sécuriser un nouveau VPS"
-    echo "  2) Voir mes VPS"
-    echo "  3) Voir les clés autorisées"
-    echo "  4) Autoriser une nouvelle clé"
-    echo "  5) Retirer une clé"
-    echo "  6) Renvoyer les clés sur tous les VPS"
-    echo "  7) Rejouer la sécurisation sur tous les VPS"
-    echo "  8) Mettre à jour l'outil"
+    echo "  2) Sécuriser un VPS déjà en production"
+    echo "  3) Audit de sécurité"
+    echo "  4) Voir mes VPS"
+    echo "  5) Voir les clés autorisées"
+    echo "  6) Autoriser une nouvelle clé"
+    echo "  7) Retirer une clé"
+    echo "  8) Renvoyer les clés sur tous les VPS"
+    echo "  9) Rejouer la sécurisation sur tous les VPS"
+    echo "  u) Mettre à jour l'outil"
     echo "  q) Quitter"
     c=$(ask "Choix" q)
     echo
     # Chaque action tourne dans un sous-shell : une erreur ramène au menu.
     case $c in
       1) (cmd_add) || true ;;
-      2) (cmd_list) || true ;;
-      3) (cmd_keys) || true ;;
-      4) (cmd_addkey) || true ;;
-      5) (cmd_delkey) || true ;;
-      6) (cmd_sync) || true ;;
-      7) (cmd_apply) || true ;;
-      8) cmd_update ;;
+      2) (cmd_adopt) || true ;;
+      3) t=$(ask "Quel VPS ? (un nom, « tous », ou compte@ip pour un serveur pas encore ajouté)" tous)
+         # shellcheck disable=SC2086
+         (cmd_audit $t) || true ;;
+      4) (cmd_list) || true ;;
+      5) (cmd_keys) || true ;;
+      6) (cmd_addkey) || true ;;
+      7) (cmd_delkey) || true ;;
+      8) (cmd_sync) || true ;;
+      9) (cmd_apply) || true ;;
+      u|U) cmd_update ;;
       q|Q) exit 0 ;;
       *) warn "Choix inconnu : $c" ;;
     esac
@@ -469,11 +754,13 @@ if (($# == 0)); then
   if [[ -t 0 && -f "$CONF" ]]; then cmd_menu; else usage; fi
   exit 0
 fi
-cmd=$1
+CMD=$1
 shift
-case $cmd in
+case $CMD in
   init)   cmd_init "$@" ;;
   add)    cmd_add "$@" ;;
+  adopt)  cmd_adopt "$@" ;;
+  audit)  cmd_audit "$@" ;;
   list|ls) cmd_list ;;
   keys)   cmd_keys ;;
   addkey) cmd_addkey "$@" ;;
