@@ -1,0 +1,84 @@
+# Modèle de stack durcie : Caddy (HTTPS) -> app -> Postgres.
+# Seul Caddy est exposé à Internet. L'app et la base n'ont aucun "ports:".
+#
+# Avant le premier lancement :
+#   mkdir -p secrets && openssl rand -base64 32 > secrets/db_password.txt && chmod 600 secrets/db_password.txt
+
+services:
+  caddy:
+    image: caddy:2.10-alpine            # toujours une version précise, jamais :latest
+    restart: unless-stopped
+    ports:
+      # Écrit explicitement en 0.0.0.0 : le daemon.json du script lie tout sur 127.0.0.1 par défaut.
+      - "0.0.0.0:80:80"
+      - "0.0.0.0:443:443"
+      - "0.0.0.0:443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks: [web]
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: ["no-new-privileges:true"]
+
+  app:
+    image: ghcr.io/ton-compte/ton-app:1.0.0
+    restart: unless-stopped
+    user: "1000:1000"                   # jamais root dans le conteneur
+    env_file: .env                      # chmod 600, hors du dépôt Git
+    environment:
+      DB_HOST: db
+      DB_PASSWORD_FILE: /run/secrets/db_password
+    secrets: [db_password]
+    networks: [web, backend]
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.0"
+          pids: 200
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_DB: app
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    secrets: [db_password]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks: [backend]                 # réseau interne : ni entrée ni sortie Internet
+    # Pas de cap_drop ALL ici : Postgres a besoin de quelques capacités pour démarrer.
+    security_opt: ["no-new-privileges:true"]
+    shm_size: 256m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d app"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # Pour une console SQL : docker compose exec db psql -U app
+
+networks:
+  web:
+  backend:
+    internal: true
+
+secrets:
+  db_password:
+    file: ./secrets/db_password.txt
+
+volumes:
+  caddy_data:
+  caddy_config:
+  pgdata:

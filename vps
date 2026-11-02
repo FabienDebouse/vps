@@ -1,0 +1,488 @@
+#!/usr/bin/env bash
+# vps : sécuriser et gérer tes VPS Debian 12 depuis ton Mac.
+#
+#   vps                             menu interactif
+#   vps add [<nom> <ip>] [options]  sécurise un nouveau VPS et crée le raccourci « ssh <nom> »
+#       --user <u>                  compte fourni par l'hébergeur (défaut : root)
+#       --port <p>                  port SSH (défaut : 22)
+#       --no-docker                 ne pas installer Docker
+#   vps list                        liste tes VPS
+#   vps keys                        liste les clés autorisées
+#   vps addkey [fichier.pub]        autorise une nouvelle clé (autre Mac, PC...)
+#   vps delkey [nom]                retire une clé
+#   vps sync [nom...]               envoie les clés sur tous les VPS (ou ceux indiqués)
+#   vps apply [nom...]              rejoue la sécurisation sur tous les VPS (ou ceux indiqués)
+#   vps rm <nom>                    retire le raccourci (ne touche pas au serveur)
+#   vps update                      installe la dernière version depuis GitHub
+#
+# Sans arguments, « vps add », « vps addkey » et « vps delkey » posent les questions.
+set -euo pipefail
+
+VPS_HOME="${VPS_HOME:-$HOME/.vps}"
+BIN_DIR="$VPS_HOME/bin"
+KEYS_DIR="$VPS_HOME/keys"
+HOSTS_DIR="$VPS_HOME/hosts"
+CONF="$VPS_HOME/config"
+HARDEN="$BIN_DIR/harden-debian12.sh"
+
+ADMIN_USER="$(id -un | tr '[:upper:]' '[:lower:]')"
+IDENTITY="$HOME/.ssh/id_ed25519"
+VPS_REPO="${VPS_REPO:-FabienDebouse/vps}"
+VPS_BRANCH="${VPS_BRANCH:-main}"
+if [[ -f "$CONF" ]]; then
+  # shellcheck source=/dev/null
+  . "$CONF"
+fi
+
+say()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
+ok()   { printf '\033[1;32m ✓\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m[!]\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
+
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; }
+
+# ask "Question" [défaut] : affiche la question et renvoie la réponse (ou le défaut).
+ask() {
+  local q=$1 def=${2:-} ans=""
+  if [[ -n "$def" ]]; then printf '%s [%s] : ' "$q" "$def" >&2; else printf '%s : ' "$q" >&2; fi
+  if ! IFS= read -r ans; then
+    echo >&2
+    [[ -n "$def" ]] || die "Pas de réponse."
+  fi
+  echo "${ans:-$def}"
+}
+
+# ask_yn "Question" o|n : vrai si la réponse est oui.
+ask_yn() {
+  local ans
+  ans=$(ask "$1 (o/n)" "$2")
+  [[ "$ans" =~ ^[oOyY] ]]
+}
+
+need_init() { [[ -f "$CONF" && -f "$HARDEN" ]] || die "Lance d'abord l'installation (voir le README)."; }
+
+host_file() { echo "$HOSTS_DIR/$1.conf"; }
+
+all_hosts() {
+  local f
+  shopt -s nullglob
+  for f in "$HOSTS_DIR"/*.conf; do basename "$f" .conf; done
+  shopt -u nullglob
+}
+
+# Les noms passés en argument (vérifiés), sinon tous les VPS.
+targets() {
+  local h
+  if (($#)); then
+    for h in "$@"; do
+      [[ -f "$(host_file "$h")" ]] || die "VPS inconnu : $h"
+      echo "$h"
+    done
+  else
+    all_hosts
+  fi
+}
+
+# Toutes les clés publiques de ~/.vps/keys, une par ligne.
+all_keys() {
+  local files
+  shopt -s nullglob
+  files=("$KEYS_DIR"/*.pub)
+  shopt -u nullglob
+  ((${#files[@]})) || die "Aucune clé dans $KEYS_DIR"
+  awk 1 "${files[@]}" | grep -E '^(ssh-|ecdsa-|sk-)' || die "Aucune clé valide dans $KEYS_DIR"
+}
+
+# Les clés encodées pour le serveur. Refuse si la clé de ce Mac n'en fait pas partie.
+keys_b64() {
+  local keys own
+  keys=$(all_keys)
+  [[ -f "$IDENTITY.pub" ]] || die "Clé introuvable : $IDENTITY.pub"
+  own=$(awk '{print $1" "$2}' "$IDENTITY.pub")
+  awk '{print $1" "$2}' <<<"$keys" | grep -qxF "$own" \
+    || die "La clé de ce Mac ($IDENTITY.pub) n'est pas dans $KEYS_DIR : tu perdrais l'accès. Annulé."
+  printf '%s\n' "$keys" | base64 | tr -d '\n'
+}
+
+# Envoie le script de durcissement et l'exécute en root, en une seule connexion
+# (donc un seul mot de passe à taper au premier passage).
+run_harden() {
+  local keys=$1 port=$2 docker=$3 sudo=$4 script remote
+  shift 4  # le reste : arguments ssh, cible comprise
+  script=$(base64 < "$HARDEN" | tr -d '\n')
+  remote="f=\$(mktemp) && echo '$script' | base64 -d > \"\$f\" && ${sudo}env NEW_USER='$ADMIN_USER' SSH_PORT='$port' INSTALL_DOCKER='$docker' AUTHORIZED_KEYS_B64='$keys' bash \"\$f\"; rc=\$?; rm -f \"\$f\"; exit \$rc"
+  ssh -t "$@" "$remote"
+}
+
+cmd_init() {
+  local src inc tmp own_key def rc="$HOME/.zshrc"
+  src=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+  mkdir -p "$BIN_DIR" "$KEYS_DIR" "$HOSTS_DIR"
+  chmod 700 "$VPS_HOME"
+
+  if [[ "$src" != "$BIN_DIR" ]]; then
+    [[ -f "$src/harden-debian12.sh" ]] || die "harden-debian12.sh doit être dans le même dossier que vps."
+    install -m 755 "${BASH_SOURCE[0]}" "$BIN_DIR/vps"
+    install -m 644 "$src/harden-debian12.sh" "$HARDEN"
+    ok "Outil installé dans $BIN_DIR"
+  fi
+
+  if [[ ! -f "$CONF" ]]; then
+    def=$ADMIN_USER
+    [[ "$def" =~ ^[a-z_][a-z0-9_-]*$ ]] || def=admin
+    while :; do
+      ADMIN_USER=$(ask "Nom d'utilisateur à créer sur tes VPS" "$def")
+      [[ "$ADMIN_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] && break
+      warn "Minuscules, chiffres, _ et - uniquement."
+    done
+    cat > "$CONF" <<EOF
+# Utilisateur créé sur chaque VPS (celui avec lequel tu te connectes).
+ADMIN_USER=$ADMIN_USER
+# Clé privée de ce Mac.
+IDENTITY="\$HOME/.ssh/id_ed25519"
+# Dépôt GitHub utilisé par « vps update ».
+VPS_REPO=$VPS_REPO
+VPS_BRANCH=$VPS_BRANCH
+EOF
+    ok "Utilisateur des VPS : $ADMIN_USER (modifiable dans $CONF)"
+  fi
+
+  if [[ ! -f "$IDENTITY" ]]; then
+    say "Création de ta clé SSH. Choisis une phrase de passe : le trousseau macOS la retiendra."
+    mkdir -p "$HOME/.ssh"
+    chmod 700 "$HOME/.ssh"
+    ssh-keygen -t ed25519 -f "$IDENTITY" -C "$(id -un)@$(hostname -s)"
+  fi
+  ssh-add --apple-use-keychain "$IDENTITY" 2>/dev/null || true
+
+  if ! awk '{print $2}' "$KEYS_DIR"/*.pub 2>/dev/null | grep -qxF "$(awk '{print $2}' "$IDENTITY.pub")"; then
+    own_key="$KEYS_DIR/$(hostname -s).pub"
+    cp "$IDENTITY.pub" "$own_key"
+    ok "Clé de ce Mac ajoutée : $own_key"
+  fi
+
+  inc="Include $HOSTS_DIR/*.conf"
+  if [[ "$VPS_HOME" == "$HOME/.vps" ]]; then
+    inc="Include ~/.vps/hosts/*.conf"
+  fi
+  mkdir -p "$HOME/.ssh"
+  chmod 700 "$HOME/.ssh"
+  touch "$HOME/.ssh/config"
+  if ! grep -qxF "$inc" "$HOME/.ssh/config"; then
+    # L'Include doit être en tête du fichier pour que ssh le prenne en compte partout.
+    tmp=$(mktemp)
+    { echo "$inc"; echo; cat "$HOME/.ssh/config"; } > "$tmp"
+    cat "$tmp" > "$HOME/.ssh/config"
+    rm -f "$tmp"
+    ok "~/.ssh/config connaît maintenant tes VPS"
+  fi
+  chmod 600 "$HOME/.ssh/config"
+
+  if [[ "$VPS_HOME" == "$HOME/.vps" ]] && ! grep -qF '.vps/bin' "$rc" 2>/dev/null; then
+    # shellcheck disable=SC2016
+    printf '\n# Outil vps (gestion des VPS)\nexport PATH="$HOME/.vps/bin:$PATH"\n' >> "$rc"
+    ok "Commande « vps » ajoutée au PATH"
+  fi
+
+  echo
+  say "Prêt. Ouvre un nouveau terminal et tape « vps »."
+}
+
+cmd_add() {
+  need_init
+  local name="" ip="" boot_user=root port=22 docker=1 sudo="" keys f sshd_conf
+  if (($# == 0)); then
+    say "Nouveau VPS"
+    while :; do
+      name=$(ask "Nom du raccourci (ex : web1)")
+      if [[ ! "$name" =~ ^[A-Za-z0-9._-]+$ ]]; then warn "Lettres, chiffres, . _ - uniquement."
+      elif [[ -f "$(host_file "$name")" ]]; then warn "$name existe déjà."
+      else break; fi
+    done
+    while :; do
+      ip=$(ask "Adresse IP du VPS")
+      [[ "$ip" =~ ^[A-Za-z0-9.:-]+$ ]] && break
+      warn "Adresse invalide."
+    done
+    boot_user=$(ask "Compte donné par l'hébergeur" root)
+    while :; do
+      port=$(ask "Port SSH" 22)
+      [[ "$port" =~ ^[0-9]+$ ]] && break
+      warn "Port invalide."
+    done
+    if ask_yn "Installer Docker ?" o; then docker=1; else docker=0; fi
+    echo
+    echo "  $name : $boot_user@$ip, port $port, Docker : $( ((docker)) && echo oui || echo non)"
+    echo "  Ensuite : connexion par clé uniquement, en tant que $ADMIN_USER, avec « ssh $name »."
+    ask_yn "On y va ?" o || die "Annulé."
+  else
+    (($# >= 2)) || die "Usage : vps add <nom> <ip> [--user root] [--port 22] [--no-docker]"
+    name=$1 ip=$2
+    shift 2
+    while (($#)); do
+      case $1 in
+        --user) boot_user=${2:?--user attend un nom}; shift 2 ;;
+        --port) port=${2:?--port attend un numéro}; shift 2 ;;
+        --no-docker) docker=0; shift ;;
+        *) die "Option inconnue : $1" ;;
+      esac
+    done
+  fi
+  [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || die "Nom invalide : $name (lettres, chiffres, . _ -)"
+  [[ "$ip" =~ ^[A-Za-z0-9.:-]+$ ]] || die "Adresse invalide : $ip"
+  [[ "$port" =~ ^[0-9]+$ ]] || die "Port invalide : $port"
+  [[ "$boot_user" =~ ^[A-Za-z0-9._-]+$ ]] || die "Compte invalide : $boot_user"
+  f=$(host_file "$name")
+  [[ ! -f "$f" ]] || die "$name existe déjà. Pour le refaire : vps rm $name"
+  [[ "$boot_user" == root ]] || sudo="sudo "
+  keys=$(keys_b64)
+
+  say "Sécurisation de $name ($boot_user@$ip). Le mot de passe du serveur peut être demandé une fois."
+  if ! run_harden "$keys" "$port" "$docker" "$sudo" -p "$port" -i "$IDENTITY" \
+       -o StrictHostKeyChecking=accept-new "$boot_user@$ip"; then
+    die "Échec. Si le serveur a déjà été sécurisé (root bloqué), relance avec : vps add $name $ip --user $ADMIN_USER"
+  fi
+
+  cat > "$f" <<EOF
+# vps: docker=$docker
+Host $name
+  HostName $ip
+  User $ADMIN_USER
+  Port $port
+  IdentityFile $IDENTITY
+  IdentitiesOnly yes
+  AddKeysToAgent yes
+  IgnoreUnknown UseKeychain
+  UseKeychain yes
+EOF
+
+  say "Vérification"
+  # On lit la config effective de sshd plutôt que de tenter une connexion root :
+  # une tentative ratée compterait comme un échec pour Fail2ban.
+  sshd_conf=$(ssh -o ConnectTimeout=10 "$name" 'sudo -n sshd -T' </dev/null) \
+    || die "« ssh $name » ne fonctionne pas. Le raccourci est dans $f."
+  ok "Connexion par clé et sudo : OK"
+  if grep -qx 'permitrootlogin no' <<<"$sshd_conf" && grep -qx 'passwordauthentication no' <<<"$sshd_conf"; then
+    ok "Root et mots de passe refusés"
+  else
+    warn "sshd accepte encore root ou les mots de passe : vérifie /etc/ssh/sshd_config.d/ sur le serveur."
+  fi
+  echo
+  ok "C'est prêt : ssh $name"
+}
+
+cmd_list() {
+  need_init
+  local h n=0
+  printf '%-20s %-24s %-6s %s\n' NOM ADRESSE PORT UTILISATEUR
+  for h in $(all_hosts); do
+    awk -v n="$h" '$1=="HostName"{ip=$2} $1=="Port"{p=$2} $1=="User"{u=$2}
+      END {printf "%-20s %-24s %-6s %s\n", n, ip, p, u}' "$(host_file "$h")"
+    n=$((n + 1))
+  done
+  ((n)) || echo "(aucun VPS : ajoute-en un avec « vps add »)"
+}
+
+cmd_keys() {
+  need_init
+  local f
+  shopt -s nullglob
+  for f in "$KEYS_DIR"/*.pub; do
+    printf '  %-28s %s\n' "$(basename "$f" .pub)" "$(ssh-keygen -lf "$f" | awk '{print $2, $NF}')"
+  done
+  shopt -u nullglob
+}
+
+# Demande d'envoyer les clés sur les VPS, s'il y en a.
+offer_sync() {
+  if [[ -z "$(all_hosts)" ]]; then return 0; fi
+  if ask_yn "Mettre à jour tous tes VPS maintenant ?" o; then
+    cmd_sync
+  else
+    echo "Pense à lancer « vps sync »."
+  fi
+}
+
+cmd_addkey() {
+  need_init
+  local src=${1:-} key def name dest tmp
+  local re='^(ssh-[a-z0-9-]+|ecdsa-sha2-[a-z0-9-]+|sk-[a-z0-9@.-]+) [A-Za-z0-9+/=]+'
+  if [[ -z "$src" ]]; then
+    src=$(ask "Chemin du fichier .pub, ou colle la clé directement")
+  fi
+  src=${src/#\~/$HOME}
+  if [[ -f "$src" ]]; then
+    key=$(grep -m1 -E '^(ssh-|ecdsa-|sk-)' "$src" || true)
+    def=$(basename "$src" .pub)
+  else
+    key=$src
+    def=$(awk '{print $3}' <<<"$key")
+  fi
+  [[ "$key" =~ $re ]] || die "Ce n'est pas une clé publique SSH."
+  tmp=$(mktemp)
+  printf '%s\n' "$key" > "$tmp"
+  ssh-keygen -lf "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; die "Clé illisible."; }
+  rm -f "$tmp"
+  if awk '{print $2}' "$KEYS_DIR"/*.pub 2>/dev/null | grep -qxF "$(awk '{print $2}' <<<"$key")"; then
+    die "Cette clé est déjà autorisée."
+  fi
+  def=$(tr -c 'A-Za-z0-9._\n-' '-' <<<"${def:-cle}")
+  while :; do
+    name=$(ask "Nom de cette clé (ex : macbook-pro, pc-bureau)" "$def")
+    dest="$KEYS_DIR/$name.pub"
+    if [[ ! "$name" =~ ^[A-Za-z0-9._-]+$ ]]; then warn "Lettres, chiffres, . _ - uniquement."
+    elif [[ -f "$dest" ]]; then warn "Une clé s'appelle déjà $name."
+    else break; fi
+  done
+  printf '%s\n' "$key" > "$dest"
+  ok "Clé « $name » autorisée."
+  offer_sync
+}
+
+cmd_delkey() {
+  need_init
+  local name=${1:-} f
+  if [[ -z "$name" ]]; then
+    cmd_keys
+    name=$(ask "Nom de la clé à retirer")
+  fi
+  f="$KEYS_DIR/$name.pub"
+  [[ "$name" =~ ^[A-Za-z0-9._-]+$ && -f "$f" ]] || die "Clé inconnue : $name"
+  if grep -qF "$(awk '{print $2}' "$IDENTITY.pub")" "$f"; then
+    die "C'est la clé de ce Mac : tu perdrais l'accès à tes VPS."
+  fi
+  rm "$f"
+  ok "Clé « $name » retirée."
+  offer_sync
+}
+
+cmd_sync() {
+  need_init
+  local keys hosts h good=0 bad=0
+  keys=$(keys_b64)
+  hosts=$(targets "$@")
+  [[ -n "$hosts" ]] || die "Aucun VPS enregistré."
+  say "Envoi de $(all_keys | wc -l | tr -d ' ') clé(s)"
+  for h in $hosts; do
+    # Écriture puis renommage : le fichier n'est jamais à moitié écrit.
+    # La seconde connexion vérifie qu'on a toujours accès avec la nouvelle liste.
+    if ssh -n -o ConnectTimeout=10 "$h" "umask 077 && mkdir -p ~/.ssh && echo '$keys' | base64 -d > ~/.ssh/authorized_keys.new && mv ~/.ssh/authorized_keys.new ~/.ssh/authorized_keys" \
+       && ssh -n -o ConnectTimeout=10 "$h" true; then
+      ok "$h"
+      good=$((good + 1))
+    else
+      warn "$h : échec"
+      bad=$((bad + 1))
+    fi
+  done
+  echo "$good OK, $bad en échec"
+  ((bad == 0))
+}
+
+cmd_apply() {
+  need_init
+  local keys hosts h f port docker good=0 bad=0
+  keys=$(keys_b64)
+  hosts=$(targets "$@")
+  [[ -n "$hosts" ]] || die "Aucun VPS enregistré."
+  for h in $hosts; do
+    say "$h"
+    f=$(host_file "$h")
+    port=$(awk '$1=="Port"{print $2}' "$f")
+    docker=$(sed -n 's/^# vps: docker=//p' "$f")
+    if run_harden "$keys" "${port:-22}" "${docker:-1}" "sudo " "$h"; then
+      ok "$h"
+      good=$((good + 1))
+    else
+      warn "$h : échec"
+      bad=$((bad + 1))
+    fi
+  done
+  echo "$good OK, $bad en échec"
+  ((bad == 0))
+}
+
+cmd_rm() {
+  need_init
+  local f
+  f=$(host_file "${1:?Usage : vps rm <nom>}")
+  [[ -f "$f" ]] || die "VPS inconnu : $1"
+  rm "$f"
+  ok "Raccourci « $1 » retiré (le serveur n'a pas été modifié)."
+}
+
+cmd_update() {
+  need_init
+  local base="${VPS_BASE_URL:-https://raw.githubusercontent.com/$VPS_REPO/$VPS_BRANCH}" tmp f
+  tmp=$(mktemp -d)
+  for f in vps harden-debian12.sh; do
+    curl -fsSL "$base/$f" -o "$tmp/$f" || { rm -rf "$tmp"; die "Téléchargement impossible : $base/$f"; }
+  done
+  if ! bash -n "$tmp/vps" || ! bash -n "$tmp/harden-debian12.sh"; then
+    rm -rf "$tmp"
+    die "Fichiers téléchargés invalides, rien n'a été changé."
+  fi
+  chmod 755 "$tmp/vps"
+  chmod 644 "$tmp/harden-debian12.sh"
+  # mv plutôt que cp : le script en cours d'exécution n'est pas réécrit sous ses pieds.
+  mv "$tmp/harden-debian12.sh" "$HARDEN"
+  mv "$tmp/vps" "$BIN_DIR/vps"
+  rm -rf "$tmp"
+  ok "vps est à jour. Pour appliquer la nouvelle sécurisation à tes serveurs : vps apply"
+  exit 0
+}
+
+cmd_menu() {
+  need_init
+  local c
+  while :; do
+    echo
+    echo "Que veux-tu faire ?"
+    echo "  1) Sécuriser un nouveau VPS"
+    echo "  2) Voir mes VPS"
+    echo "  3) Voir les clés autorisées"
+    echo "  4) Autoriser une nouvelle clé"
+    echo "  5) Retirer une clé"
+    echo "  6) Renvoyer les clés sur tous les VPS"
+    echo "  7) Rejouer la sécurisation sur tous les VPS"
+    echo "  8) Mettre à jour l'outil"
+    echo "  q) Quitter"
+    c=$(ask "Choix" q)
+    echo
+    # Chaque action tourne dans un sous-shell : une erreur ramène au menu.
+    case $c in
+      1) (cmd_add) || true ;;
+      2) (cmd_list) || true ;;
+      3) (cmd_keys) || true ;;
+      4) (cmd_addkey) || true ;;
+      5) (cmd_delkey) || true ;;
+      6) (cmd_sync) || true ;;
+      7) (cmd_apply) || true ;;
+      8) cmd_update ;;
+      q|Q) exit 0 ;;
+      *) warn "Choix inconnu : $c" ;;
+    esac
+  done
+}
+
+if (($# == 0)); then
+  if [[ -t 0 && -f "$CONF" ]]; then cmd_menu; else usage; fi
+  exit 0
+fi
+cmd=$1
+shift
+case $cmd in
+  init)   cmd_init "$@" ;;
+  add)    cmd_add "$@" ;;
+  list|ls) cmd_list ;;
+  keys)   cmd_keys ;;
+  addkey) cmd_addkey "$@" ;;
+  delkey) cmd_delkey "$@" ;;
+  sync)   cmd_sync "$@" ;;
+  apply)  cmd_apply "$@" ;;
+  rm)     cmd_rm "$@" ;;
+  update) cmd_update ;;
+  menu)   cmd_menu ;;
+  help|-h|--help) usage ;;
+  *) usage; exit 1 ;;
+esac
